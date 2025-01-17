@@ -17,8 +17,13 @@
         "@types/node": "^22.10.7",
         "dotenv": "^16.4.7",
         "express": "^4.21.2",
+        "jimp": "^1.6.0",
+        "replace-color": "^2.3.0",
         "ts-node": "^10.9.2",
         "ts-node-dev": "^2.0.0",
         "typescript": "^5.7.3"
+    },
+    "devDependencies": {
+        "moment": "^2.30.1"
     }
 }

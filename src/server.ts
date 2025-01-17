@@ -1,5 +1,13 @@
 import express, { Request, Response } from "express";
 import dotenv from "dotenv";
+import { createHash } from "crypto";
+import Jimp from "jimp";
+import { recognize } from "node-tesseract-ocr";
+// @ts-ignore
+import replaceColor from "replace-color";
+import { Client } from "undici";
+import { defaultHeaders, generateDeviceId, getTimeNow } from "./util";
+import { wasmEnc } from "./loadWasm";
 
 dotenv.config();
 
@@ -10,66 +18,170 @@ app.use(express.json());
 class BankAccountService {
     private readonly API_URL =
         "https://online.mbbank.com.vn/api/retail_web/transfer/inquiryAccountName";
-    private readonly KEEP_ALIVE_URL =
-        "https://online.mbbank.com.vn/api/retail_web/internetbanking/getFavorBeneficiaryList";
     private readonly AUTH_TOKEN = "Basic RU1CUkVUQUlMV0VCOlNEMjM0ZGZnMzQlI0BGR0AzNHNmc2RmNDU4NDNm";
-    private readonly SESSION_ID: string;
-    private readonly REF_NO = "NGUYENKHOA0721-2025011711133277-81789";
+    private sessionId: string | null = null;
+    private readonly username: string;
+    private readonly password: string;
+    private readonly deviceId: string;
+    private client: Client;
     private keepAliveInterval: NodeJS.Timeout | null = null;
+    private wasmData!: Buffer;
 
     constructor() {
-        const sessionId = process.env.MB_BANK_SESSION_ID;
-        if (!sessionId) {
-            throw new Error("MB_BANK_SESSION_ID environment variable is not set");
+        const username = process.env.MB_BANK_USERNAME;
+        const password = process.env.MB_BANK_PASSWORD;
+
+        if (!username || !password) {
+            throw new Error(
+                "MB_BANK_USERNAME and MB_BANK_PASSWORD environment variables are required"
+            );
         }
-        this.SESSION_ID = sessionId;
-        this.startKeepAlive();
+
+        this.username = username;
+        this.password = password;
+        this.deviceId = generateDeviceId();
+        this.client = new Client("https://online.mbbank.com.vn");
+
+        this.initialize();
     }
 
-    private startKeepAlive() {
-        console.log("Starting keep-alive service...");
-        // Initial keep-alive call
-        this.keepAliveCall();
-
-        // Set up interval for subsequent calls
-        this.keepAliveInterval = setInterval(() => {
-            this.keepAliveCall();
-        }, 60000); // Run every 1 minute
-    }
-
-    private async keepAliveCall() {
+    private async initialize() {
         try {
-            const response = await fetch(this.KEEP_ALIVE_URL, {
+            await this.login();
+        } catch (error) {
+            console.error("Failed to initialize service:", error);
+            throw error;
+        }
+    }
+
+    private async login(): Promise<boolean> {
+        try {
+            console.log("Logging in...");
+            const rId = getTimeNow();
+            const headers = defaultHeaders as any;
+            headers["X-Request-Id"] = rId;
+
+            console.log("Getting Captcha");
+
+            // Get captcha
+            const captchaRes = await this.client.request({
                 method: "POST",
-                headers: {
-                    Authorization: this.AUTH_TOKEN,
-                    "Content-Type": "application/json",
-                },
+                path: "/api/retail-web-internetbankingms/getCaptchaImage",
+                headers,
                 body: JSON.stringify({
-                    transactionType: "PAYMENT",
-                    searchType: "LATEST",
-                    sessionId: this.SESSION_ID,
-                    refNo: this.REF_NO,
+                    sessionId: "",
+                    refNo: rId,
+                    deviceIdCommon: this.deviceId,
                 }),
             });
 
-            if (!response.ok) {
-                throw new Error(`Keep-alive HTTP error! status: ${response.status}`);
+            console.log("Got Captcha");
+
+            const captchaData = (await captchaRes.body.json()) as any;
+
+            console.log("Got Captcha Data", captchaData);
+            let captchaBuffer = Buffer.from(captchaData.imageString, "base64");
+
+            console.log("Processing Captcha");
+
+            // Process captcha image
+            const captchaImage1 = await replaceColor({
+                image: captchaBuffer,
+                colors: {
+                    type: "hex",
+                    targetColor: "#847069",
+                    replaceColor: "#ffffff",
+                },
+            });
+            captchaBuffer = await captchaImage1.getBufferAsync("image/png");
+
+            const captchaImage2 = await replaceColor({
+                image: captchaBuffer,
+                colors: {
+                    type: "hex",
+                    targetColor: "#ffe3d5",
+                    replaceColor: "#ffffff",
+                },
+            });
+            captchaBuffer = await captchaImage2.getBufferAsync("image/png");
+
+            const captchaContent = (
+                await recognize(captchaBuffer, {
+                    lang: "eng",
+                    oem: 1,
+                    psm: 7,
+                })
+            )
+                .replaceAll("\n", "")
+                .replaceAll(" ", "")
+                .trim();
+
+            console.log("Got Captcha Content", captchaContent);
+
+            // Validate captcha
+            if (captchaContent.length !== 6 || !/^[a-z0-9]+$/i.test(captchaContent)) {
+                return this.login();
             }
 
-            const data = await response.json();
-            console.log("Keep-alive call successful:", new Date().toISOString());
+            // Login request
+            const loginData = {
+                userId: this.username,
+                password: createHash("md5").update(this.password).digest("hex"),
+                captcha: captchaContent,
+                deviceIdCommon: this.deviceId,
+                sessionId: null,
+                refNo: Date.now().toString(),
+            };
+
+            if (!this.wasmData) {
+                const wasm = await this.client.request({
+                    method: "GET",
+                    path: "/assets/wasm/main.wasm",
+                    headers: defaultHeaders,
+                });
+                this.wasmData = Buffer.from(await wasm.body.arrayBuffer());
+            }
+
+            const loginRes = await this.client.request({
+                method: "POST",
+                path: "/api/retail_web/internetbanking/v2.0/doLogin",
+                headers,
+                body: JSON.stringify({
+                    dataEnc: await wasmEnc(this.wasmData, loginData, "0"),
+                }),
+            });
+
+            const loginResult = (await loginRes.body.json()) as any;
+
+            if (loginResult.result?.ok) {
+                this.sessionId = loginResult.sessionId;
+                console.log("Login successful");
+                return true;
+            } else if (loginResult.result?.responseCode === "GW283") {
+                return this.login(); // Retry on specific error
+            } else {
+                throw new Error(
+                    `Login failed: (${loginResult.result?.responseCode}): ${loginResult.result?.message}`
+                );
+            }
         } catch (error) {
-            console.error("Keep-alive call failed:", error);
+            console.error("Login failed:", error);
+            throw error;
         }
     }
 
-    async lookupAccount(bankBin: string, accountNo: string) {
+    async lookupAccount(bankBin: string, accountNo: string): Promise<any> {
         try {
-            const response = await fetch(this.API_URL, {
+            // Ensure we have a valid session
+            if (!this.sessionId) {
+                await this.login();
+            }
+
+            const response = await this.client.request({
                 method: "POST",
+                path: "/api/retail_web/transfer/inquiryAccountName",
                 headers: {
-                    authorization: this.AUTH_TOKEN,
+                    Authorization: this.AUTH_TOKEN,
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
@@ -78,18 +190,20 @@ class BankAccountService {
                     bankCode: bankBin,
                     debitAccount: accountNo,
                     type: "FAST",
-                    sessionId: this.SESSION_ID,
-                    refNo: this.REF_NO,
+                    sessionId: this.sessionId,
+                    refNo: Date.now().toString(),
+                    deviceIdCommon: this.deviceId,
                 }),
             });
 
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
+            const data = (await response.body.json()) as any;
 
-            const data = await response.json();
-
-            if (!data.result.ok || data.result.responseCode !== "00") {
+            if (!data.result.ok) {
+                if (data.result.responseCode === "GW200") {
+                    // Session expired, try to login again
+                    await this.login();
+                    return this.lookupAccount(bankBin, accountNo);
+                }
                 throw new Error(`API error: ${data.result.message}`);
             }
 
