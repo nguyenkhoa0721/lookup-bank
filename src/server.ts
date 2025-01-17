@@ -188,7 +188,7 @@ class BankAccountService {
                     creditAccount: accountNo,
                     creditAccountType: "ACCOUNT",
                     bankCode: bankBin,
-                    debitAccount: accountNo,
+                    debitAccount: "0935823570",
                     type: "FAST",
                     sessionId: this.sessionId,
                     refNo: Date.now().toString(),
