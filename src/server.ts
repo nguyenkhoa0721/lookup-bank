@@ -189,7 +189,7 @@ class BankAccountService {
                     creditAccountType: "ACCOUNT",
                     bankCode: bankBin,
                     debitAccount: "0935823570",
-                    type: "FAST",
+                    type: bankBin == "970422" ? "INHOUSE" : "FAST",
                     sessionId: this.sessionId,
                     refNo: Date.now().toString(),
                     deviceIdCommon: this.deviceId,
